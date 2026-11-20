@@ -3,12 +3,12 @@
 
 import argparse
 import hashlib
+import json
 import re
 import time
 from pathlib import Path
 
 import requests
-from openpyxl import Workbook
 
 
 API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
@@ -18,11 +18,20 @@ FIELDS = ",".join([
     "title",
     "authors",
     "year",
+    "publicationDate",
     "venue",
     "url",
     "externalIds",
     "openAccessPdf",
 ])
+
+# Inclusive publication-year window. Search walks this
+# range from the newest year backward.
+DEFAULT_YEAR_FROM = 2010
+DEFAULT_YEAR_TO = 2026
+
+# Relevance search returns at most this many hits per query.
+MAX_RESULTS_PER_QUERY = 1000
 
 
 def safe_filename(text, max_length=150):
@@ -41,6 +50,93 @@ def safe_filename(text, max_length=150):
 
     # Avoid filenames ending in a period or space.
     return text[:max_length].rstrip(". ")
+
+
+def pdf_filename(number, paper_id, prefix=""):
+    """
+    Build a short PDF filename.
+
+    The paper title is not included. It is stored
+    in the sibling JSON file.
+
+    0001_PAPERID.pdf
+    0001_Hydro_PAPERID.pdf
+    """
+
+    parts = [f"{number:04d}"]
+
+    if prefix:
+        short_prefix = safe_filename(
+            prefix,
+            max_length=40,
+        )
+        short_prefix = short_prefix.replace(" ", "_")
+
+        if short_prefix:
+            parts.append(short_prefix)
+
+    parts.append(paper_id or "unknown")
+
+    return "_".join(parts) + ".pdf"
+
+
+def publication_path_parts(publication_date, year):
+    """
+    Split a publication date into YYYYMM and DD folders.
+
+    2024-03-15 -> ("202403", "15")
+    2024-03    -> ("202403", "00")
+    2024       -> ("202400", "00")
+
+    00 means Semantic Scholar did not provide that part.
+    """
+
+    text = str(publication_date or "").strip()
+
+    match = re.fullmatch(
+        r"(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?",
+        text,
+    )
+
+    if match:
+        year_text = match.group(1)
+        month = match.group(2) or "00"
+        day = match.group(3) or "00"
+
+        if not 1 <= int(month) <= 12:
+            month = "00"
+            day = "00"
+
+        if not 1 <= int(day) <= 31:
+            day = "00"
+
+        return f"{year_text}{month}", day
+
+    if year:
+        return f"{int(year):04d}00", "00"
+
+    return None
+
+
+def storage_directory(output_dir, year_month, day):
+    """
+    Store files under output_dir/YYYYMM/DD.
+
+    The folders use the paper's publication date.
+    """
+
+    folder = (
+        output_dir
+        / year_month
+        / day
+    )
+
+    folder.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    return folder
 
 
 def file_hash(path):
@@ -80,15 +176,40 @@ def create_session():
     return session
 
 
+def years_newest_first(year_from, year_to):
+    """
+    Publication years from year_to down to year_from.
+    """
+
+    return range(year_to, year_from - 1, -1)
+
+
+def paper_year(paper):
+    """
+    Return the paper's publication year as an int, or None.
+    """
+
+    value = paper.get("year")
+
+    if value is None or value == "":
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def search_papers(
     query,
     offset,
     limit,
     session,
+    year,
     max_retries=7,
 ):
     """
-    Search Semantic Scholar.
+    Search Semantic Scholar for one publication year.
 
     Handles:
         429 rate limiting
@@ -96,13 +217,26 @@ def search_papers(
         502 bad gateway
         503 service unavailable
         504 gateway timeout
+
+    One relevance query can return at most 1,000 hits.
+    Callers move to the previous year after that window.
     """
+
+    window = MAX_RESULTS_PER_QUERY - offset
+
+    if window <= 0:
+        return {
+            "data": [],
+            "total": 0,
+            "next": None,
+        }
 
     params = {
         "query": query,
         "offset": offset,
-        "limit": min(limit, 100),
+        "limit": min(limit, 100, window),
         "fields": FIELDS,
+        "year": str(year),
 
         # Request papers for which Semantic Scholar
         # reports an open-access PDF.
@@ -368,99 +502,28 @@ def download_pdf(
     return False, "Download failed"
 
 
-def create_excel(
-    excel_path,
-    records,
-):
+def write_metadata(pdf_path, record):
     """
-    Create an Excel workbook containing only
-    successfully downloaded PDFs.
+    Write one JSON metadata file beside the PDF.
+
+    The JSON name matches the PDF stem, so
+    0001_PAPERID.pdf
+    becomes
+    0001_PAPERID.json
     """
 
-    workbook = Workbook()
+    metadata_path = pdf_path.with_suffix(".json")
 
-    worksheet = workbook.active
-    worksheet.title = "Downloaded Papers"
+    metadata_path.write_text(
+        json.dumps(
+            record,
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
 
-    headers = [
-        "Number",
-        "Title",
-        "Authors",
-        "Year",
-        "Venue",
-        "DOI",
-        "Paper URL",
-        "PDF URL",
-        "SHA256",
-        "Filename",
-    ]
-
-    worksheet.append(headers)
-
-    for record in records:
-
-        worksheet.append([
-            record["number"],
-            record["title"],
-            record["authors"],
-            record["year"],
-            record["venue"],
-            record["doi"],
-            record["paper_url"],
-            record["pdf_url"],
-            record["sha256"],
-            record["filename"],
-        ])
-
-    # Freeze the header row.
-    worksheet.freeze_panes = "A2"
-
-    # Make URLs clickable.
-    for row in range(
-        2,
-        worksheet.max_row + 1,
-    ):
-
-        paper_url_cell = worksheet.cell(
-            row=row,
-            column=7,
-        )
-
-        pdf_url_cell = worksheet.cell(
-            row=row,
-            column=8,
-        )
-
-        if paper_url_cell.value:
-            paper_url_cell.hyperlink = (
-                paper_url_cell.value
-            )
-
-        if pdf_url_cell.value:
-            pdf_url_cell.hyperlink = (
-                pdf_url_cell.value
-            )
-
-    # Set column widths.
-    widths = {
-        "A": 10,
-        "B": 60,
-        "C": 45,
-        "D": 10,
-        "E": 30,
-        "F": 35,
-        "G": 65,
-        "H": 65,
-        "I": 70,
-        "J": 70,
-    }
-
-    for column, width in widths.items():
-        worksheet.column_dimensions[
-            column
-        ].width = width
-
-    workbook.save(excel_path)
+    return metadata_path
 
 
 def main():
@@ -492,8 +555,9 @@ def main():
         "--output",
         default="papers",
         help=(
-            "Download directory. "
-            "Default: papers"
+            "Download directory. Files are stored by "
+            "publication date as YYYYMM/DD inside "
+            "this path. Default: papers"
         ),
     )
 
@@ -501,8 +565,9 @@ def main():
         "--prefix",
         default="",
         help=(
-            "Optional prefix for PDF filenames. "
-            "Example: --prefix 'ML Healthcare'"
+            "Optional short label added to filenames. "
+            "The paper title is stored in the JSON file. "
+            "Example: --prefix Hydro"
         ),
     )
 
@@ -536,6 +601,28 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--year-from",
+        type=int,
+        default=DEFAULT_YEAR_FROM,
+        help=(
+            "Earliest publication year to include. "
+            f"Default: {DEFAULT_YEAR_FROM}."
+        ),
+    )
+
+    parser.add_argument(
+        "--year-to",
+        type=int,
+        default=DEFAULT_YEAR_TO,
+        help=(
+            "Latest publication year to include. "
+            "Search starts at this year and moves "
+            "backward. "
+            f"Default: {DEFAULT_YEAR_TO}."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.max_results <= 0:
@@ -558,6 +645,11 @@ def main():
             "--search-delay cannot be negative"
         )
 
+    if args.year_from > args.year_to:
+        parser.error(
+            "--year-from cannot be later than --year-to"
+        )
+
     # Convert the output directory to an absolute path.
     script_dir = Path(__file__).resolve().parent
 
@@ -573,10 +665,6 @@ def main():
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
-    )
-
-    excel_path = (
-        output_dir / "papers.xlsx"
     )
 
     session = create_session()
@@ -606,7 +694,11 @@ def main():
     )
 
     print(
-        f"Excel file:      {excel_path}"
+        "Date folders:    publication YYYYMM/DD"
+    )
+
+    print(
+        "Metadata:        JSON file beside each PDF"
     )
 
     print(
@@ -626,6 +718,11 @@ def main():
         f"Search delay:    {args.search_delay}s"
     )
 
+    print(
+        f"Years:           {args.year_to} down to "
+        f"{args.year_from}"
+    )
+
     print()
 
     print(
@@ -642,407 +739,500 @@ def main():
     # Semantic Scholar paper IDs already processed.
     seen_paper_ids = set()
 
-    offset = 0
     total_available = None
+    stop_search = False
 
-    while (
-        len(downloaded_records)
-        < args.max_results
+    for search_year in years_newest_first(
+        args.year_from,
+        args.year_to,
     ):
 
-        print("-" * 70)
-
-        print(
-            f"Searching results "
-            f"{offset + 1}-"
-            f"{offset + args.page_size}..."
-        )
-
-        try:
-
-            result = search_papers(
-                query=args.query,
-                offset=offset,
-                limit=args.page_size,
-                session=session,
-            )
-
-        except requests.RequestException as exc:
-
-            print()
-            print(
-                f"Search failed permanently: {exc}"
-            )
-            print()
-            break
-
-        except Exception as exc:
-
-            print()
-            print(
-                f"Unexpected search error: {exc}"
-            )
-            print()
-            break
-
-        papers = result.get(
-            "data",
-            [],
-        )
-
-        total_available = result.get(
-            "total"
-        )
-
-        next_offset = result.get(
-            "next"
-        )
-
-        print(
-            f"Received {len(papers)} results."
-        )
-
-        if total_available is not None:
-
-            print(
-                "Matching results reported by "
-                f"Semantic Scholar: "
-                f"{total_available:,}"
-            )
-
-        if not papers:
-
-            print(
-                "No more search results."
-            )
-
-            break
-
-        for paper in papers:
-
-            if (
-                len(downloaded_records)
-                >= args.max_results
-            ):
-                break
-
-            paper_id = paper.get(
-                "paperId"
-            )
-
-            # Avoid processing the same paper twice.
-            if (
-                paper_id
-                and paper_id in seen_paper_ids
-            ):
-                continue
-
-            if paper_id:
-                seen_paper_ids.add(
-                    paper_id
-                )
-
-            title = (
-                paper.get("title")
-                or "Untitled"
-            )
-
-            authors = ", ".join(
-                author.get("name", "")
-                for author in (
-                    paper.get("authors")
-                    or []
-                )
-                if author.get("name")
-            )
-
-            year = (
-                paper.get("year")
-                or ""
-            )
-
-            venue = (
-                paper.get("venue")
-                or ""
-            )
-
-            external_ids = (
-                paper.get("externalIds")
-                or {}
-            )
-
-            doi = external_ids.get(
-                "DOI",
-                "",
-            )
-
-            paper_url = paper.get(
-                "url",
-                "",
-            )
-
-            open_access = (
-                paper.get("openAccessPdf")
-                or {}
-            )
-
-            pdf_url = open_access.get(
-                "url"
-            )
-
-            print()
-            print(
-                f"Current successful downloads: "
-                f"{len(downloaded_records)}/"
-                f"{args.max_results}"
-            )
-
-            print(
-                f"Paper: {title}"
-            )
-
-            if not pdf_url:
-
-                print(
-                    "  No PDF URL. Skipping."
-                )
-
-                continue
-
-            # The number is based only on successful
-            # unique downloads.
-            download_number = (
-                len(downloaded_records) + 1
-            )
-
-            safe_title = safe_filename(
-                title
-            )
-
-            # Build filename.
-            #
-            # Without prefix:
-            # 01 - Paper Title [paperid].pdf
-            #
-            # With prefix:
-            # 01 - ML Healthcare - Paper Title [paperid].pdf
-
-            filename_parts = [
-                f"{download_number:02d}",
-            ]
-
-            if filename_prefix:
-                filename_parts.append(
-                    filename_prefix
-                )
-
-            filename_parts.append(
-                safe_title
-            )
-
-            filename = " - ".join(
-                filename_parts
-            )
-
-            if paper_id:
-                filename += (
-                    f" [{paper_id[:12]}]"
-                )
-
-            filename += ".pdf"
-
-            destination = (
-                output_dir / filename
-            )
-
-            # Prevent overwriting an existing file.
-            if destination.exists():
-
-                counter = 2
-
-                while True:
-
-                    base_name = (
-                        destination.stem
-                    )
-
-                    candidate = (
-                        output_dir
-                        / (
-                            f"{base_name} "
-                            f"({counter}).pdf"
-                        )
-                    )
-
-                    if not candidate.exists():
-
-                        destination = candidate
-                        break
-
-                    counter += 1
-
-            print(
-                f"  PDF URL: {pdf_url}"
-            )
-
-            success, message = download_pdf(
-                url=pdf_url,
-                destination=destination,
-                session=session,
-            )
-
-            if not success:
-
-                destination.unlink(
-                    missing_ok=True
-                )
-
-                print(
-                    f"  FAILED: {message}"
-                )
-
-                continue
-
-            # Calculate SHA-256.
-            try:
-
-                digest = file_hash(
-                    destination
-                )
-
-            except OSError as exc:
-
-                destination.unlink(
-                    missing_ok=True
-                )
-
-                print(
-                    f"  Hashing failed: {exc}"
-                )
-
-                continue
-
-            # Detect duplicate PDF content.
-            if digest in seen_hashes:
-
-                destination.unlink(
-                    missing_ok=True
-                )
-
-                print(
-                    "  DUPLICATE: PDF deleted."
-                )
-
-                continue
-
-            seen_hashes.add(
-                digest
-            )
-
-            # The PDF is now officially considered
-            # a successful download.
-            record = {
-                "number": download_number,
-                "title": title,
-                "authors": authors,
-                "year": year,
-                "venue": venue,
-                "doi": doi,
-                "paper_url": paper_url,
-                "pdf_url": pdf_url,
-                "sha256": digest,
-                "filename": destination.name,
-            }
-
-            downloaded_records.append(
-                record
-            )
-
-            # Save Excel immediately.
-            create_excel(
-                excel_path,
-                downloaded_records,
-            )
-
-            print()
-            print(
-                "  SUCCESS!"
-            )
-
-            print(
-                f"  Saved: {destination.name}"
-            )
-
-            print(
-                f"  Progress: "
-                f"{len(downloaded_records)}/"
-                f"{args.max_results}"
-            )
-
-            print(
-                f"  Directory: {output_dir}"
-            )
-
-            if (
-                len(downloaded_records)
-                >= args.max_results
-            ):
-                break
-
-            if args.delay > 0:
-
-                time.sleep(
-                    args.delay
-                )
-
-        # Target reached.
         if (
-            len(downloaded_records)
+            stop_search
+            or len(downloaded_records)
             >= args.max_results
         ):
             break
 
-        # Get the next search page.
-        if next_offset is not None:
+        print("=" * 70)
+        print(
+            f"Publication year {search_year}"
+        )
+        print("=" * 70)
 
-            offset = next_offset
+        offset = 0
 
-        else:
-
-            offset += len(papers)
-
-        # Fewer results than requested means we have
-        # reached the end of the available results.
-        if (
-            len(papers)
-            < args.page_size
+        while (
+            len(downloaded_records)
+            < args.max_results
         ):
+
+            if offset >= MAX_RESULTS_PER_QUERY:
+
+                print()
+                print(
+                    "Reached the 1,000-result "
+                    f"limit for {search_year}."
+                )
+
+                break
+
+            page_end = min(
+                offset + args.page_size,
+                MAX_RESULTS_PER_QUERY,
+            )
+
+            print("-" * 70)
+
+            print(
+                f"Searching {search_year} "
+                f"results {offset + 1}-"
+                f"{page_end}..."
+            )
+
+            try:
+
+                result = search_papers(
+                    query=args.query,
+                    offset=offset,
+                    limit=args.page_size,
+                    session=session,
+                    year=search_year,
+                )
+
+            except requests.RequestException as exc:
+
+                print()
+                print(
+                    f"Search failed permanently: {exc}"
+                )
+                print()
+                stop_search = True
+                break
+
+            except Exception as exc:
+
+                print()
+                print(
+                    f"Unexpected search error: {exc}"
+                )
+                print()
+                stop_search = True
+                break
+
+            papers = result.get(
+                "data",
+                [],
+            )
+
+            total_available = result.get(
+                "total"
+            )
+
+            next_offset = result.get(
+                "next"
+            )
+
+            print(
+                f"Received {len(papers)} results."
+            )
+
+            if total_available is not None:
+
+                print(
+                    "Matching results reported by "
+                    f"Semantic Scholar: "
+                    f"{total_available:,}"
+                )
+
+            if not papers:
+
+                print(
+                    f"No more results for {search_year}."
+                )
+
+                break
+
+            for paper in papers:
+
+                if (
+                    len(downloaded_records)
+                    >= args.max_results
+                ):
+                    break
+
+                paper_id = paper.get(
+                    "paperId"
+                )
+
+                # Avoid processing the same paper twice.
+                if (
+                    paper_id
+                    and paper_id in seen_paper_ids
+                ):
+                    continue
+
+                if paper_id:
+                    seen_paper_ids.add(
+                        paper_id
+                    )
+
+                title = (
+                    paper.get("title")
+                    or "Untitled"
+                )
+
+                authors = [
+                    author.get("name", "")
+                    for author in (
+                        paper.get("authors")
+                        or []
+                    )
+                    if author.get("name")
+                ]
+
+                year = paper_year(paper)
+
+                if year != search_year:
+
+                    print(
+                        f"  Skip: {title}"
+                    )
+
+                    print(
+                        "  Year "
+                        f"{year if year is not None else 'unknown'}"
+                        f" does not match {search_year}."
+                    )
+
+                    continue
+
+                venue = (
+                    paper.get("venue")
+                    or ""
+                )
+
+                external_ids = (
+                    paper.get("externalIds")
+                    or {}
+                )
+
+                doi = external_ids.get(
+                    "DOI",
+                    "",
+                )
+
+                paper_url = paper.get(
+                    "url",
+                    "",
+                )
+
+                open_access = (
+                    paper.get("openAccessPdf")
+                    or {}
+                )
+
+                pdf_url = open_access.get(
+                    "url"
+                )
+
+                print()
+                print(
+                    f"Current successful downloads: "
+                    f"{len(downloaded_records)}/"
+                    f"{args.max_results}"
+                )
+
+                print(
+                    f"Paper: {title}"
+                )
+
+                if not pdf_url:
+
+                    print(
+                        "  No PDF URL. Skipping."
+                    )
+
+                    continue
+
+                # The number is based only on successful
+                # unique downloads. The title stays in
+                # the JSON file so the PDF name stays short.
+                download_number = (
+                    len(downloaded_records) + 1
+                )
+
+                filename = pdf_filename(
+                    download_number,
+                    paper_id,
+                    filename_prefix,
+                )
+
+                publication_date = (
+                    paper.get("publicationDate")
+                    or ""
+                )
+
+                path_parts = publication_path_parts(
+                    publication_date,
+                    year,
+                )
+
+                if path_parts is None:
+
+                    print(
+                        "  No publication date. Skipping."
+                    )
+
+                    continue
+
+                year_month, pub_day = path_parts
+
+                if int(year_month[:4]) != search_year:
+
+                    print(
+                        "  Publication date "
+                        f"{publication_date or year} "
+                        f"does not match {search_year}. "
+                        "Skipping."
+                    )
+
+                    continue
+
+                day_dir = storage_directory(
+                    output_dir,
+                    year_month,
+                    pub_day,
+                )
+
+                destination = (
+                    day_dir / filename
+                )
+
+                # Prevent overwriting an existing file.
+                if destination.exists():
+
+                    counter = 2
+
+                    while True:
+
+                        base_name = (
+                            destination.stem
+                        )
+
+                        candidate = (
+                            day_dir
+                            / (
+                                f"{base_name} "
+                                f"({counter}).pdf"
+                            )
+                        )
+
+                        if not candidate.exists():
+
+                            destination = candidate
+                            break
+
+                        counter += 1
+
+                print(
+                    f"  PDF URL: {pdf_url}"
+                )
+
+                success, message = download_pdf(
+                    url=pdf_url,
+                    destination=destination,
+                    session=session,
+                )
+
+                if not success:
+
+                    destination.unlink(
+                        missing_ok=True
+                    )
+
+                    print(
+                        f"  FAILED: {message}"
+                    )
+
+                    continue
+
+                # Calculate SHA-256.
+                try:
+
+                    digest = file_hash(
+                        destination
+                    )
+
+                except OSError as exc:
+
+                    destination.unlink(
+                        missing_ok=True
+                    )
+
+                    print(
+                        f"  Hashing failed: {exc}"
+                    )
+
+                    continue
+
+                # Detect duplicate PDF content.
+                if digest in seen_hashes:
+
+                    destination.unlink(
+                        missing_ok=True
+                    )
+
+                    print(
+                        "  DUPLICATE: PDF deleted."
+                    )
+
+                    continue
+
+                seen_hashes.add(
+                    digest
+                )
+
+                record = {
+                    "number": download_number,
+                    "paper_id": paper_id or "",
+                    "title": title,
+                    "authors": authors,
+                    "year": year,
+                    "publication_date": publication_date,
+                    "venue": venue,
+                    "doi": doi,
+                    "paper_url": paper_url,
+                    "pdf_url": pdf_url,
+                    "sha256": digest,
+                    "filename": destination.name,
+                }
+
+                try:
+
+                    metadata_path = write_metadata(
+                        destination,
+                        record,
+                    )
+
+                except OSError as exc:
+
+                    destination.unlink(
+                        missing_ok=True
+                    )
+
+                    seen_hashes.discard(
+                        digest
+                    )
+
+                    print(
+                        f"  Metadata write failed: {exc}"
+                    )
+
+                    continue
+
+                # The PDF is now officially considered
+                # a successful download.
+                downloaded_records.append(
+                    record
+                )
+
+                print()
+                print(
+                    "  SUCCESS!"
+                )
+
+                print(
+                    f"  Saved: {destination.name}"
+                )
+
+                print(
+                    f"  Metadata: {metadata_path.name}"
+                )
+
+                print(
+                    f"  Progress: "
+                    f"{len(downloaded_records)}/"
+                    f"{args.max_results}"
+                )
+
+                print(
+                    f"  Directory: {day_dir}"
+                )
+
+                if (
+                    len(downloaded_records)
+                    >= args.max_results
+                ):
+                    break
+
+                if args.delay > 0:
+
+                    time.sleep(
+                        args.delay
+                    )
+
+            # Target reached.
+            if (
+                len(downloaded_records)
+                >= args.max_results
+            ):
+                break
+
+            # Get the next search page.
+            if next_offset is not None:
+
+                offset = next_offset
+
+            else:
+
+                offset += len(papers)
+
+            # Fewer results than requested means this
+            # publication year has no further pages.
+            if (
+                len(papers)
+                < args.page_size
+            ):
+
+                print()
+                print(
+                    f"Finished publication year "
+                    f"{search_year}."
+                )
+
+                break
 
             print()
             print(
-                "Reached the end of the "
-                "available search results."
+                f"Waiting {args.search_delay}s "
+                "before the next search page..."
             )
 
+            if args.search_delay > 0:
+
+                time.sleep(
+                    args.search_delay
+                )
+
+        if (
+            stop_search
+            or len(downloaded_records)
+            >= args.max_results
+        ):
             break
 
-        print()
-        print(
-            f"Waiting {args.search_delay}s "
-            "before the next search page..."
-        )
-
         if args.search_delay > 0:
+
+            print()
+            print(
+                f"Waiting {args.search_delay}s "
+                "before the previous year..."
+            )
 
             time.sleep(
                 args.search_delay
             )
-
-    # Always save the final Excel file.
-    create_excel(
-        excel_path,
-        downloaded_records,
-    )
 
     print()
     print("=" * 70)
@@ -1057,11 +1247,6 @@ def main():
     print(
         f"Download folder: "
         f"{output_dir}"
-    )
-
-    print(
-        f"Excel file:      "
-        f"{excel_path}"
     )
 
     print("=" * 70)
@@ -1084,8 +1269,8 @@ def main():
         )
 
         print(
-            "The Excel file contains only "
-            "successful downloads."
+            "Each saved PDF has a matching "
+            "JSON metadata file."
         )
 
 
